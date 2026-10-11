@@ -1,5 +1,7 @@
 # echo_core
 
+[![dotnet](https://github.com/dctooandy/echo_core/actions/workflows/dotnet.yml/badge.svg)](https://github.com/dctooandy/echo_core/actions/workflows/dotnet.yml)
+
 個人專案 EchoNote（裝置端語音轉文字＋會議摘要的 Flutter App）的跨平台 C 音訊核心，從 App 的 monorepo 抽出公開。C 原始碼只有一份（`src/`），由 build hook 在建置時編譯給 iOS、macOS、Android，Dart 透過 `dart:ffi` 呼叫。綁定用 `ffigen` 從標頭檔產生，不手寫。同一份 C 另外包成 Swift（SwiftPM）、Kotlin（JNI）與 C#（P/Invoke）三種不經過 Flutter 的版本；用 clang／gcc 編譯時，四種包裝的編譯參數都相同。
 
 > **Android 實機驗證進行中**：Android 的建置、dart:ffi 冒煙測試與 JNI instrumented test 已在模擬器（arm64、Android 13）通過；實機效能數字之後補上。
@@ -99,7 +101,7 @@ using (var vad = new EchoVad())                 // ec_vad_create 失敗時丟 Ou
 dotnet test dotnet/EchoCore.Tests   # 需要 .NET SDK 8 以上與 CMake；建置前會自動用 CMake 編原生庫
 ```
 
-測試 8 項：`Pcm16ToFloat`（含寫進 `Span` 與長度不符）、`Rms`、`Waveform` 的已知值；VAD「安靜 → 說話 → 安靜」；預設值與標頭一致；`Dispose` 兩次與之後使用丟例外；沒有 `Dispose` 時由 finalizer 釋放。測試專案設 `RollForward=Major`，只裝了較新 .NET runtime 的機器也能跑。
+測試 8 項：`Pcm16ToFloat`（含寫進 `Span` 與長度不符）、`Rms`、`Waveform` 的已知值；VAD「安靜 → 說話 → 安靜」；預設值與標頭一致；`Dispose` 兩次與之後使用丟例外；沒有 `Dispose` 時由 finalizer 釋放。測試專案設 `RollForward=Major`，只裝了較新 .NET runtime 的機器也能跑。公開 repo 的 GitHub Actions（`.github/workflows/dotnet.yml`）在 Windows（MSVC、`echo_core.dll`）、macOS、Linux 上各跑一次這 8 項測試。
 
 之後的方向：打包成 NuGet，原生庫依平台放進 `runtimes/<rid>/native/`。
 
