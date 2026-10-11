@@ -1,0 +1,170 @@
+# Push a tag vMAJOR.MINOR.PATCH (or vMAJOR.MINOR.PATCH-suffix for a
+# prerelease) to publish. Every job must pass; nothing is published otherwise.
+#
+#   ci → version → native (5 RIDs) → pack → verify (fresh project per OS) → release
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      suffix: ${{ steps.check.outputs.suffix }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          suffix=$(python3 scripts/check_version.py --tag "$GITHUB_REF_NAME")
+          echo "suffix=$suffix" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+  native:
+    needs: [ci, version]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { rid: win-x64,     os: windows-latest,   cmake: '-A x64' }
+          - { rid: osx-arm64,   os: macos-latest,     cmake: '-DCMAKE_OSX_ARCHITECTURES=arm64',  arch: arm64 }
+          - { rid: osx-x64,     os: macos-latest,     cmake: '-DCMAKE_OSX_ARCHITECTURES=x86_64', arch: x86_64 }
+          - { rid: linux-x64,   os: ubuntu-latest,    cmake: '', arch: x86-64 }
+          - { rid: linux-arm64, os: ubuntu-24.04-arm, cmake: '', arch: aarch64 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build/native -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake }}
+          cmake --build build/native --config Release
+      - name: Check exports
+        run: $([ "$RUNNER_OS" = Windows ] && echo python || echo python3) scripts/check_exports.py build/native
+      - name: Stage as runtimes/${{ matrix.rid }}/native
+        run: |
+          mkdir -p "stage/${{ matrix.rid }}/native"
+          find build/native \( -name libecho_core.dylib -o -name libecho_core.so -o -name echo_core.dll \) \
+            -exec cp {} "stage/${{ matrix.rid }}/native/" \;
+          ls -l "stage/${{ matrix.rid }}/native"
+      # osx-x64 is cross-compiled on an arm64 runner and can't be run there;
+      # this checks the architecture instead.
+      - name: Check architecture
+        if: matrix.arch != ''
+        run: |
+          lib=$(ls stage/${{ matrix.rid }}/native/*)
+          if [ "$RUNNER_OS" = macOS ]; then lipo -info "$lib" | grep -qw '${{ matrix.arch }}'; else file "$lib" | grep -q '${{ matrix.arch }}'; fi
+          echo "$lib is ${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.rid }}
+          path: stage
+
+  pack:
+    needs: [version, native]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: runtimes
+          merge-multiple: true
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Pack
+        run: |
+          dotnet pack dotnet/EchoCore -c Release -o nupkg \
+            -p:EchoCoreRuntimesDir="$PWD/runtimes" \
+            -p:VersionSuffix="${{ needs.version.outputs.suffix }}"
+      - name: Check the package has all five native libraries
+        run: |
+          unzip -l nupkg/*.nupkg | grep runtimes/
+          test "$(unzip -l nupkg/*.nupkg | grep -c 'runtimes/.*/native/')" -eq 5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: nupkg/*.nupkg
+
+  # Installs the package into a brand-new project, the way a user would, so
+  # this tests the package and not the source tree.
+  verify:
+    needs: [version, pack]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nupkg
+          path: nupkg
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install into a new project and run
+        run: |
+          mkdir consumer && cd consumer
+          cat > consumer.csproj <<'XML'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+            </PropertyGroup>
+          </Project>
+          XML
+          cat > Program.cs <<'CS'
+          using EchoNote.Audio;
+          var (major, minor, patch) = EchoCore.Version;
+          using var vad = new EchoVad();
+          Console.WriteLine($"{major}.{minor}.{patch} {EchoCore.Rms([16384, -16384])} {vad.Process([0, 0])}");
+          CS
+          dotnet nuget add source "$GITHUB_WORKSPACE/nupkg" --name local
+          dotnet add package Dctooandy.EchoCore --version "${{ needs.version.outputs.version }}"
+          out=$(dotnet run | tr -d '\r')
+          echo "$out"
+          base="${{ needs.version.outputs.version }}"
+          test "$out" = "${base%%-*} 0.5 False"
+
+  release:
+    needs: [version, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nupkg
+          path: nupkg
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          python3 scripts/check_version.py --notes "${version%%-*}" > notes.md
+          prerelease=""
+          if [ -n "${{ needs.version.outputs.suffix }}" ]; then prerelease="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" nupkg/*.nupkg --title "echo_core $version" --notes-file notes.md $prerelease
+      - name: GitHub Packages
+        run: |
+          dotnet nuget push nupkg/*.nupkg \
+            --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
+            --api-key "${{ github.token }}"

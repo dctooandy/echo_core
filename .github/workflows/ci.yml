@@ -1,0 +1,55 @@
+# Every push and PR: all four test suites that run without a device, plus the
+# version and ABI checks. release.yml calls this before building a release.
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check_version.py
+
+  dotnet:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      # The test project builds the native library with CMake first.
+      - run: dotnet test dotnet/EchoCore.Tests
+      # Windows has `python`, not `python3`.
+      - run: $([ "$RUNNER_OS" = Windows ] && echo python || echo python3) scripts/check_exports.py build/native
+        shell: bash
+
+  dart:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.12.2'
+      - run: dart pub get
+      # The build hook compiles the C++ core; the tests compare it with the
+      # pure-Dart reference bit for bit.
+      - run: dart test
+
+  swift:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift test
